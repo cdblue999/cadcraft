@@ -115,7 +115,13 @@ impl Outcome {
     pub fn message(&self) -> String {
         match self.status {
             XrefStatus::Loaded => format!("\"{}\" loaded from {}.", self.name, self.detail),
-            _ => format!("Xref \"{}\" not loaded: {}.", self.name, self.detail),
+            _ => {
+                if self.name.is_empty() {
+                    self.detail.clone()
+                } else {
+                    format!("Xref \"{}\" not loaded: {}.", self.name, self.detail)
+                }
+            }
         }
     }
 }
@@ -200,6 +206,32 @@ fn candidates(path: &str, host: Option<&Path>, chosen: bool) -> (Vec<PathBuf>, O
     (out, refused)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn find_file_case_insensitive(p: &Path) -> Option<PathBuf> {
+    if p.is_file() {
+        return Some(p.to_path_buf());
+    }
+    let parent = match p.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let target_name = p.file_name()?.to_str()?;
+    let entries = std::fs::read_dir(parent).ok()?;
+    for entry in entries.flatten() {
+        if let Ok(file_type) = entry.file_type()
+            && (file_type.is_file() || file_type.is_symlink())
+        {
+            let name = entry.file_name();
+            if let Some(s) = name.to_str()
+                && (s.eq_ignore_ascii_case(target_name) || s.to_lowercase() == target_name.to_lowercase())
+            {
+                return Some(entry.path());
+            }
+        }
+    }
+    None
+}
+
 /// The file a referenced drawing at `path` (saved in the drawing at `host`, or just `chosen` by
 /// the user) is loaded from.
 pub(crate) fn find(path: &str, host: Option<&Path>, chosen: bool) -> Result<PathBuf, Missing> {
@@ -208,7 +240,7 @@ pub(crate) fn find(path: &str, host: Option<&Path>, chosen: bool) -> Result<Path
     }
     let (files, refused) = candidates(path, host, chosen);
     #[cfg(not(target_arch = "wasm32"))]
-    let found = files.into_iter().find(|p| p.is_file());
+    let found = files.iter().find_map(|p| find_file_case_insensitive(p));
     #[cfg(target_arch = "wasm32")]
     let found: Option<PathBuf> = {
         let _ = files;
@@ -335,7 +367,7 @@ fn fetch(path: &str, host: Option<&Path>, chosen: bool, cx: &mut Ctx, depth: usi
         x.blocks.values().filter(|b| b.xref_path.is_some() && !b.xref_overlay && !b.name.contains('|')).map(|b| b.name.clone()).collect();
     for n in nested {
         let (status, detail) = load_in(&mut x, &n, Some(&file), false, cx, depth + 1);
-        if status != XrefStatus::Loaded {
+        if status != XrefStatus::Loaded && detail != "circular reference" {
             cx.notes.push(format!("nested xref \"{n}\" not loaded: {detail}"));
         }
     }
@@ -573,5 +605,33 @@ mod tests {
         assert!(got.editing.is_none());
         let ArrayKind::Rect(r) = got.kind else { panic!("not a rectangular array") };
         assert_eq!((r.cols, r.rows), (3, 2));
+    }
+
+    #[test]
+    fn outcome_message_formatting() {
+        let loaded = Outcome { name: "SITE".into(), status: XrefStatus::Loaded, detail: "/path/site.dxf".into() };
+        assert_eq!(loaded.message(), "\"SITE\" loaded from /path/site.dxf.");
+
+        let failed = Outcome { name: "SITE".into(), status: XrefStatus::NotFound, detail: "file not found".into() };
+        assert_eq!(failed.message(), "Xref \"SITE\" not loaded: file not found.");
+
+        let note = Outcome { name: String::new(), status: XrefStatus::Unresolved, detail: "nested xref \"child\" not loaded: file not found".into() };
+        assert_eq!(note.message(), "nested xref \"child\" not loaded: file not found");
+    }
+
+    #[test]
+    fn case_insensitive_file_finding() {
+        let dir = std::env::temp_dir().join("xref_ci_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("Plan-Gajowicka.dxf");
+        let _ = std::fs::write(&file, b"test");
+
+        let found = find_file_case_insensitive(&dir.join("plan-gajowicka.dxf"));
+        assert_eq!(found, Some(file.clone()));
+
+        let found_upper = find_file_case_insensitive(&dir.join("PLAN-GAJOWICKA.DXF"));
+        assert_eq!(found_upper, Some(file));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
